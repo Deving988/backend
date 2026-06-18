@@ -24,7 +24,7 @@ const PORT = process.env.PORT || 3000;
 // ==================== MIDDLEWARE ====================
 app.use(cors({
   origin: [
-    'https://sidfit.in',
+    'https://deving988.github.io/frontend',
     'https://www.sidfit.in',
     'http://localhost:3000',
     'http://127.0.0.1:5500',
