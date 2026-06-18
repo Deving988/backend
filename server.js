@@ -24,7 +24,7 @@ const PORT = process.env.PORT || 3000;
 // ==================== MIDDLEWARE ====================
 app.use(cors({
   origin: [
-    'https://deving988.github.io/frontend'
+    'https://deving988.github.io/frontend';
     process.env.FRONTEND_URL
   ].filter(Boolean),
   credentials: true
