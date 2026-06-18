@@ -24,8 +24,7 @@ const PORT = process.env.PORT || 3000;
 // ==================== MIDDLEWARE ====================
 app.use(cors({
   origin: [
-    'https://deving988.github.io/frontend',
-    'https://deving988.github.io/frontend/admin',
+    'https://deving988.github.io',
     'http://localhost:3000',
     'http://127.0.0.1:5500',
     process.env.FRONTEND_URL
