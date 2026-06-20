@@ -26,6 +26,7 @@ const mongoose        = require('mongoose');
 const Razorpay        = require('razorpay');
 const nodemailer      = require('nodemailer');
 const jwt              = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
 const cloudinary       = require('cloudinary').v2;
 const rateLimit        = require('express-rate-limit');
 
@@ -40,6 +41,14 @@ cloudinary.config({
 });
 const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || 'sidfit';
 const cloudinaryReady = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+
+// ==================== GOOGLE SIGN-IN ====================
+// We only need the Client ID here — verifyIdToken() checks the token's
+// signature against Google's public keys, so no client secret is needed
+// for this flow (that's only required for server-side authorization code
+// exchange, which we don't use).
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const googleAuthReady = !!process.env.GOOGLE_CLIENT_ID;
 
 // ==================== MIDDLEWARE ====================
 app.use(cors({
@@ -74,7 +83,7 @@ app.use(['/api/products', '/api/banners'], (req, res, next) => {
   if (req.method === 'GET') return next();
   return writeLimiter(req, res, next);
 });
-app.use(['/api/auth/send-otp', '/api/auth/verify-otp'], authLimiter);
+app.use(['/api/auth/google'], authLimiter);
 
 // ==================== MONGODB CONNECTION ====================
 mongoose.set('strictQuery', true);
@@ -147,15 +156,18 @@ const bannerSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 // User Schema (email OTP login)
+// User Schema — Google Sign-In.
+// FIX: per Google's own guidance, the "sub" claim (here: googleId) is the
+// only safe unique identifier for an account — a Google Account's email
+// address can change over time, so email must never be used as the
+// primary key. We store it for display only and look users up by googleId.
 const userSchema = new mongoose.Schema({
-  email:          { type: String, unique: true, required: true, lowercase: true, trim: true },
+  googleId:       { type: String, unique: true, required: true },
+  email:          { type: String, required: true, lowercase: true, trim: true },
   name:           { type: String, default: '' },
+  picture:        { type: String, default: '' },
   phone:          { type: String, default: '' },
   savedAddresses: { type: [String], default: [] },
-  otp:            { type: String, default: null },
-  otpExpiry:      { type: Date, default: null },
-  otpAttempts:    { type: Number, default: 0 },
-  verified:       { type: Boolean, default: false },
 }, { timestamps: true });
 
 const Product    = mongoose.model('Product',    productSchema);
@@ -221,19 +233,31 @@ function buildTransport() {
   });
 }
 
-if (process.env.EMAIL_USER && (process.env.EMAIL_PASS || process.env.SMTP_PASS)) {
+// FIX: this used to require EMAIL_USER specifically, which silently
+// disabled email entirely for a Brevo-only setup (SMTP_HOST/SMTP_USER/
+// SMTP_PASS with no EMAIL_USER set). Now it activates if EITHER a Gmail
+// config OR a custom SMTP provider config is present.
+const hasGmailConfig = !!(process.env.EMAIL_USER && process.env.EMAIL_PASS);
+const hasSmtpConfig  = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+
+if (hasGmailConfig || hasSmtpConfig) {
   mailer = buildTransport();
   mailer.verify((err) => {
     if (err) {
       console.error('❌ Email transport failed to verify:', err.message);
-      console.error('   → Check EMAIL_USER/EMAIL_PASS (must be a Gmail App Password, not your login password).');
+      if (hasSmtpConfig) {
+        console.error('   → Check SMTP_HOST/SMTP_USER/SMTP_PASS in your .env — these came from your SMTP provider dashboard (e.g. Brevo).');
+      } else {
+        console.error('   → Check EMAIL_USER/EMAIL_PASS (must be a Gmail App Password, not your login password).');
+        console.error('   → Note: Render\'s free tier blocks outbound SMTP ports (465/587), so Gmail SMTP will ALWAYS time out there — use SMTP_HOST/SMTP_USER/SMTP_PASS with a provider like Brevo instead.');
+      }
       console.error('   → See .env.example for step-by-step setup instructions.');
     } else {
       console.log('✅ Email transport verified and ready');
     }
   });
 } else {
-  console.warn('⚠️  Email not configured — EMAIL_USER/EMAIL_PASS missing. Order/OTP emails will be skipped.');
+  console.warn('⚠️  Email not configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_USER/SMTP_PASS (e.g. Brevo). Order/OTP emails will be skipped.');
 }
 
 // ==================== EMAIL HELPER (timeout-guarded, never blocks the response) ====================
@@ -249,9 +273,15 @@ async function sendEmail({ to, subject, html }) {
     console.warn(`📧 Email skipped (not configured) → would have sent to ${to}: ${subject}`);
     return { sent: false, reason: 'not_configured' };
   }
+  // FIX: the "from" address used to be hardcoded to EMAIL_USER (the Gmail
+  // variable), which breaks once you switch to a provider like Brevo where
+  // the SMTP login (SMTP_USER) and the address you want shown to customers
+  // (EMAIL_FROM) aren't necessarily the same. This now falls back sensibly:
+  // EMAIL_FROM → EMAIL_USER → SMTP_USER, so it works with any provider.
+  const fromAddress = process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER;
   try {
     await withTimeout(
-      mailer.sendMail({ from: `"SIDFIT" <${process.env.EMAIL_USER}>`, to, subject, html }),
+      mailer.sendMail({ from: `"SIDFIT" <${fromAddress}>`, to, subject, html }),
       12000,
       'sendMail'
     );
@@ -376,23 +406,6 @@ function orderStatusEmail(order) {
   </div>`;
 }
 
-function otpEmail(otp) {
-  return `
-  <div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:auto;background:#fff">
-    <div style="background:#0a0a0a;padding:28px;text-align:center">
-      <h1 style="font-family:Impact,sans-serif;color:#fff;letter-spacing:6px;font-size:24px;margin:0">SIDFIT</h1>
-    </div>
-    <div style="padding:40px 32px;text-align:center">
-      <p style="font-size:14px;color:#666;margin:0 0 24px">Your login OTP is:</p>
-      <div style="background:#f4f4f2;padding:24px;letter-spacing:12px;font-size:36px;font-weight:700;color:#0a0a0a;font-family:monospace">${otp}</div>
-      <p style="font-size:13px;color:#999;margin:20px 0 0">Valid for 10 minutes. Do not share this OTP with anyone.</p>
-    </div>
-    <div style="background:#f4f4f2;padding:16px;text-align:center">
-      <p style="margin:0;font-size:11px;color:#999">© 2026 SIDFIT · sidfit.in</p>
-    </div>
-  </div>`;
-}
-
 // ==================== AUTH MIDDLEWARE ====================
 function adminAuth(req, res, next) {
   const key = req.headers['x-admin-key'];
@@ -418,10 +431,11 @@ function userAuth(req, res, next) {
 // Health check
 app.get('/', (req, res) => {
   res.json({
-    status: 'SIDFIT Backend v3.0 Running ✅',
+    status: 'SIDFIT Backend v4.0 Running ✅',
     db: mongoose.connection.readyState === 1 ? 'MongoDB Connected ✅' : '❌ Disconnected',
     cloudinary: cloudinaryReady ? '✅ Configured' : '⚠️ Not configured',
     email: mailer ? '✅ Configured' : '⚠️ Not configured',
+    googleSignIn: googleAuthReady ? '✅ Configured' : '⚠️ Not configured',
     timestamp: new Date().toISOString()
   });
 });
@@ -727,62 +741,45 @@ app.delete('/api/banners/:id', adminAuth, async (req, res) => {
 });
 
 // ============================================================
-// USER AUTH — Email OTP
+// USER AUTH — Google Sign-In
 // ============================================================
 
-app.post('/api/auth/send-otp', async (req, res) => {
+// Frontend sends the ID token (JWT) it got from Google's Sign-In button.
+// We verify it against Google's public keys (this also confirms it was
+// issued for OUR Client ID and hasn't expired), then create/find the user
+// by googleId — never by email, per Google's own identifier guidance.
+app.post('/api/auth/google', async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email?.includes('@')) return res.status(400).json({ error: 'Invalid email' });
+    if (!googleAuthReady) {
+      return res.status(503).json({ error: 'Google Sign-In is not configured on the server.' });
+    }
+    const { credential } = req.body;
+    if (!credential) return res.status(400).json({ error: 'Missing Google credential' });
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch (err) {
+      return res.status(401).json({ error: 'Invalid or expired Google sign-in. Please try again.' });
+    }
 
-    await User.findOneAndUpdate(
-      { email: email.toLowerCase() },
-      { otp, otpExpiry, otpAttempts: 0 },
+    const { sub: googleId, email, name, picture } = payload;
+    if (!googleId || !email) {
+      return res.status(400).json({ error: 'Google did not return the expected account info.' });
+    }
+
+    const user = await User.findOneAndUpdate(
+      { googleId },
+      { googleId, email: email.toLowerCase(), name: name || '', picture: picture || '' },
       { upsert: true, new: true }
     );
 
-    const result = await sendEmail({
-      to: email,
-      subject: `${otp} — SIDFIT Login OTP`,
-      html: otpEmail(otp)
-    });
-
-    if (!result.sent) {
-      return res.status(502).json({ error: 'Could not send OTP email right now. Please try again in a moment.' });
-    }
-
-    res.json({ message: 'OTP sent ✅' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/auth/verify-otp', async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
-
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(404).json({ error: 'User not found. Please request OTP again.' });
-
-    if (user.otp !== otp) {
-      user.otpAttempts = (user.otpAttempts || 0) + 1;
-      await user.save();
-      return res.status(400).json({ error: 'Invalid OTP' });
-    }
-    if (new Date() > user.otpExpiry) return res.status(400).json({ error: 'OTP expired. Please request a new one.' });
-
-    user.otp = null;
-    user.otpExpiry = null;
-    user.otpAttempts = 0;
-    user.verified = true;
-    await user.save();
-
     const token = jwt.sign(
-      { userId: user._id, email: user.email },
+      { userId: user._id, googleId: user.googleId },
       process.env.JWT_SECRET || 'sidfit_jwt_secret_change_me',
       { expiresIn: '30d' }
     );
@@ -794,6 +791,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         id: user._id,
         email: user.email,
         name: user.name,
+        picture: user.picture,
         phone: user.phone,
         savedAddresses: user.savedAddresses,
       }
@@ -805,12 +803,13 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
 app.get('/api/auth/profile', userAuth, async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId).select('-otp -otpExpiry');
+    const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({
       id: user._id,
       email: user.email,
       name: user.name,
+      picture: user.picture,
       phone: user.phone,
       savedAddresses: user.savedAddresses,
     });
@@ -826,7 +825,7 @@ app.put('/api/auth/profile', userAuth, async (req, res) => {
       req.user.userId,
       { name, phone, savedAddresses },
       { new: true }
-    ).select('-otp -otpExpiry');
+    );
     res.json({ message: 'Profile updated ✅', user });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -835,11 +834,12 @@ app.put('/api/auth/profile', userAuth, async (req, res) => {
 
 app.get('/api/auth/my-orders', userAuth, async (req, res) => {
   try {
+    // FIX: the old JWT carried { userId, email } from the OTP flow. The new
+    // Google-based JWT carries { userId, googleId } — there is no `email`
+    // on req.user anymore, so matching only by userId is correct (and
+    // safer, since email can legitimately change on a Google account).
     const orders = await Order.find({
-      $or: [
-        { userId: req.user.userId },
-        { 'customer.email': req.user.email }
-      ],
+      userId: req.user.userId,
       status: { $ne: 'pending' }
     }).sort({ createdAt: -1 });
     res.json(orders);
@@ -850,7 +850,9 @@ app.get('/api/auth/my-orders', userAuth, async (req, res) => {
 
 app.get('/api/users', adminAuth, async (req, res) => {
   try {
-    const users = await User.find({ verified: true }).select('-otp -otpExpiry').sort({ createdAt: -1 });
+    // Every user here signed in via Google, so there's no separate
+    // "verified" concept anymore — Google already confirmed the account.
+    const users = await User.find().sort({ createdAt: -1 });
     res.json(users);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1050,11 +1052,12 @@ app.use((err, req, res, next) => {
 
 // ==================== START ====================
 app.listen(PORT, () => {
-  console.log(`\n🚀 SIDFIT Backend v3.0 running on port ${PORT}`);
-  console.log(`📦 MongoDB    : ${process.env.MONGO_URI ? '✅ URI Set' : '⚠️  NOT SET'}`);
-  console.log(`☁️  Cloudinary : ${cloudinaryReady ? '✅ Set' : '⚠️  NOT SET'}`);
-  console.log(`🔑 Razorpay   : ${razorpayReady ? '✅ Set' : '⚠️  NOT SET'}`);
-  console.log(`📧 Email      : ${process.env.EMAIL_USER || '⚠️  NOT SET'}`);
-  console.log(`🔐 JWT        : ${process.env.JWT_SECRET ? '✅ Set' : '⚠️  Using default (change in production!)'}`);
-  console.log(`🔐 Admin key  : ${process.env.ADMIN_SECRET ? '✅ Set' : '⚠️  NOT SET — admin panel will be inaccessible'}`);
+  console.log(`\n🚀 SIDFIT Backend v4.0 running on port ${PORT}`);
+  console.log(`📦 MongoDB     : ${process.env.MONGO_URI ? '✅ URI Set' : '⚠️  NOT SET'}`);
+  console.log(`☁️  Cloudinary  : ${cloudinaryReady ? '✅ Set' : '⚠️  NOT SET'}`);
+  console.log(`🔑 Razorpay    : ${razorpayReady ? '✅ Set' : '⚠️  NOT SET'}`);
+  console.log(`📧 Email       : ${(process.env.EMAIL_USER || process.env.SMTP_USER) || '⚠️  NOT SET'}`);
+  console.log(`👤 Google Auth : ${googleAuthReady ? '✅ Set' : '⚠️  NOT SET — login will be unavailable'}`);
+  console.log(`🔐 JWT         : ${process.env.JWT_SECRET ? '✅ Set' : '⚠️  Using default (change in production!)'}`);
+  console.log(`🔐 Admin key   : ${process.env.ADMIN_SECRET ? '✅ Set' : '⚠️  NOT SET — admin panel will be inaccessible'}`);
 });
